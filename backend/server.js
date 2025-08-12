@@ -10,15 +10,23 @@ const noteRoutes = require('./routes/notes');
 const Note = require('./models/Note');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+    origin: "https://notes-app-xo1c.onrender.com",
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    credentials: true
+}));
+
 app.use(express.json());
 
 app.use('/api/auth', authRoutes);
 app.use('/api/notes', noteRoutes);
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' } // refine later to frontend URL
+const io = require("socket.io")(server, {
+    cors: {
+        origin: "https://notes-app-xo1c.onrender.com",
+        methods: ["GET", "POST"]
+    }
 });
 
 /**
