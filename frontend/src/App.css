@@ -1,42 +1,172 @@
+/* Global Styles */
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #f8fafc;
+}
+
 #root {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: filter 300ms;
-}
-.logo:hover {
-  filter: drop-shadow(0 0 2em #646cffaa);
-}
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafbaa);
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
 }
 
-@keyframes logo-spin {
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* ReactQuill Custom Styles */
+.ql-editor {
+  font-family: 'Inter', sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.ql-toolbar {
+  border-top: 1px solid #e2e8f0 !important;
+  border-left: 1px solid #e2e8f0 !important;
+  border-right: 1px solid #e2e8f0 !important;
+  border-bottom: none !important;
+  background: #f8fafc;
+}
+
+.ql-container {
+  border-bottom: 1px solid #e2e8f0 !important;
+  border-left: 1px solid #e2e8f0 !important;
+  border-right: 1px solid #e2e8f0 !important;
+  border-top: none !important;
+  font-family: 'Inter', sans-serif;
+}
+
+.ql-editor.ql-blank::before {
+  font-style: normal;
+  color: #94a3b8;
+  font-size: 16px;
+}
+
+/* Animation Classes */
+@keyframes fadeIn {
   from {
-    transform: rotate(0deg);
+    opacity: 0;
+    transform: translateY(20px);
   }
   to {
-    transform: rotate(360deg);
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  a:nth-of-type(2) .logo {
-    animation: logo-spin infinite 20s linear;
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
   }
 }
 
-.card {
-  padding: 2em;
+.fade-in {
+  animation: fadeIn 0.3s ease-out;
 }
 
-.read-the-docs {
-  color: #888;
+.slide-in {
+  animation: slideIn 0.3s ease-out;
+}
+
+/* Loading Animation */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Custom Button Styles */
+.MuiButton-root {
+  transition: all 0.2s ease-in-out !important;
+}
+
+.MuiButton-root:hover {
+  transform: translateY(-1px);
+}
+
+/* Card Hover Effects */
+.MuiCard-root {
+  transition: all 0.2s ease-in-out !important;
+}
+
+.MuiCard-root:hover {
+  transform: translateY(-2px);
+  box-shadow: 0px 8px 25px -5px rgba(0, 0, 0, 0.1) !important;
+}
+
+/* Custom Focus Styles */
+.MuiTextField-root .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+  border-width: 2px !important;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .MuiContainer-root {
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+  }
+}
+
+/* Dark mode specific styles */
+[data-theme="dark"] {
+  background-color: #0f172a;
+}
+
+[data-theme="dark"] .ql-toolbar {
+  background: #1e293b;
+  border-color: #334155 !important;
+}
+
+[data-theme="dark"] .ql-container {
+  border-color: #334155 !important;
+}
+
+[data-theme="dark"] .ql-editor {
+  color: #f8fafc;
+}
+
+[data-theme="dark"] .ql-editor.ql-blank::before {
+  color: #64748b;
 }

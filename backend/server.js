@@ -10,11 +10,17 @@ const noteRoutes = require('./routes/notes');
 const Note = require('./models/Note');
 
 const app = express();
+
+
 app.use(cors({
-    origin: "https://notes-app-xo1c.onrender.com",
-    methods: ["GET", "POST", "PUT", "DELETE"],
-    credentials: true
+  origin: [
+    "http://localhost:5173",         // for local dev
+    "https://notes-app-xo1c.onrender.com",  // deployed frontend
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true
 }));
+
 
 app.use(express.json());
 
@@ -23,11 +29,16 @@ app.use('/api/notes', noteRoutes);
 
 const server = http.createServer(app);
 const io = require("socket.io")(server, {
-    cors: {
-        origin: "https://notes-app-xo1c.onrender.com",
-        methods: ["GET", "POST"]
-    }
+  cors: {
+    origin: [
+      "http://localhost:5173",           // frontend dev server
+      "https://notes-app-xo1c.onrender.com" // deployed frontend
+    ],
+    methods: ["GET", "POST"],
+    credentials: true
+  }
 });
+
 
 /**
  * Socket.IO: Rooms per note ID.
