@@ -1,4 +1,4 @@
-const { test } = require('node:test');
+﻿const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createNotePersistence } = require('../lib/notePersistence');
 
@@ -63,12 +63,12 @@ test('debounces rapid edits and persists only the latest content', async () => {
     debounceMs: 25,
     maxWaitMs: 200,
     logger: silentLogger,
-    onPersisted: (id, version) => persisted.push({ id, version })
+    onPersisted: (id, result) => persisted.push({ id, ...result })
   });
 
-  persistence.queue(noteId(), 'first', 0);
-  persistence.queue(noteId(), 'second', 0);
-  persistence.queue(noteId(), 'third', 0);
+  persistence.queue(noteId(), 'first', 0, { clientEditId: 1 });
+  persistence.queue(noteId(), 'second', 0, { clientEditId: 2 });
+  persistence.queue(noteId(), 'third', 0, { clientEditId: 3 });
 
   await waitFor(() => Note.calls.length === 1);
   await waitFor(() => persistence.pendingCount() === 0);
@@ -76,13 +76,16 @@ test('debounces rapid edits and persists only the latest content', async () => {
   assert.equal(Note.calls.length, 1);
   assert.equal(Note.calls[0].update.$set.content, 'third');
   assert.equal(Note.state.content, 'third');
-  assert.deepEqual(persisted, [{ id: noteId(), version: 1 }]);
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].content, 'third');
+  assert.equal(persisted[0].contentVersion, 1);
+  assert.equal(persisted[0].clientEditId, 3);
 
   const flushed = await persistence.flushAll();
   assert.equal(flushed.ok, true);
 });
 
-test('persists an edit queued while an earlier save is in flight', async () => {
+test('persists edits queued while an earlier save is in flight', async () => {
   let releaseFirstSave;
   let firstSaveStarted;
   const firstSaveGate = new Promise((resolve) => {
@@ -102,29 +105,91 @@ test('persists an edit queued while an earlier save is in flight', async () => {
     }
   });
 
+  const persisted = [];
   const persistence = createNotePersistence({
     Note,
     debounceMs: 10,
     maxWaitMs: 100,
-    logger: silentLogger
+    logger: silentLogger,
+    onPersisted: (id, result) => persisted.push(result)
   });
 
-  persistence.queue(noteId(), 'first', 0);
+  persistence.queue(noteId(), 'first', 0, { clientEditId: 1 });
   await firstSaveStartedPromise;
 
-  persistence.queue(noteId(), 'second', 0);
+  persistence.queue(noteId(), 'second', 0, { clientEditId: 2 });
   releaseFirstSave();
 
   await waitFor(() => Note.calls.length === 2);
+  await waitFor(() => persistence.pendingCount() === 0);
   assert.deepEqual(
     Note.calls.map((call) => call.update.$set.content),
     ['first', 'second']
   );
   assert.equal(Note.state.content, 'second');
+  assert.equal(Note.state.contentVersion, 2);
+  assert.deepEqual(
+    persisted.map((entry) => ({ content: entry.content, version: entry.contentVersion })),
+    [
+      { content: 'first', version: 1 },
+      { content: 'second', version: 2 }
+    ]
+  );
 
   const flushed = await persistence.flushAll();
   assert.equal(flushed.ok, true);
+});
+
+test('accepts a same-client edit that trails its own completed save by one revision', async () => {
+  const Note = createFakeNote();
+  const persisted = [];
+  const conflicts = [];
+  const persistence = createNotePersistence({
+    Note,
+    debounceMs: 5,
+    maxWaitMs: 100,
+    logger: silentLogger,
+    onPersisted: (id, result) => persisted.push(result),
+    onConflict: (id, result) => conflicts.push(result)
+  });
+
+  const first = persistence.queue(noteId(), 'first', 0, {
+    sourceKey: 'user-a:client-a',
+    clientEditId: 1
+  });
+  assert.deepEqual(first, { ok: true });
+  await waitFor(() => persisted.length === 1);
   assert.equal(persistence.pendingCount(), 0);
+
+  const followUp = persistence.queue(noteId(), 'second', 0, {
+    sourceKey: 'user-a:client-a',
+    clientEditId: 2
+  });
+  assert.deepEqual(followUp, { ok: true });
+  assert.equal(
+    persistence.canContinue(noteId(), 0, 'user-a:client-a'),
+    true
+  );
+  assert.equal(
+    persistence.canContinue(noteId(), 0, 'user-b:client-b'),
+    false
+  );
+
+  await waitFor(() => Note.state.content === 'second');
+  await waitFor(() => persistence.pendingCount() === 0);
+
+  assert.deepEqual(conflicts, []);
+  assert.equal(Note.state.contentVersion, 2);
+  assert.deepEqual(
+    persisted.map((entry) => ({
+      content: entry.content,
+      contentVersion: entry.contentVersion
+    })),
+    [
+      { content: 'first', contentVersion: 1 },
+      { content: 'second', contentVersion: 2 }
+    ]
+  );
 });
 
 test('retries failed saves without dropping the latest content', async () => {
@@ -171,7 +236,7 @@ test('reports retry exhaustion without claiming persistence succeeded', async ()
     retryMaxMs: 10,
     maxAttempts: 2,
     logger: silentLogger,
-    onFailed: (id) => failed.push(id),
+    onFailed: (id, result) => failed.push({ id, ...result }),
     onPersisted: (id) => persisted.push(id)
   });
 
@@ -181,6 +246,7 @@ test('reports retry exhaustion without claiming persistence succeeded', async ()
   assert.equal(Note.calls.length, 2);
   assert.deepEqual(persisted, []);
   assert.equal(persistence.pendingCount(), 0);
+  assert.equal(failed[0].clientEditId, null);
 
   const flushed = await persistence.flushAll();
   assert.equal(flushed.ok, false);
@@ -230,32 +296,171 @@ test('waits for pending writes during shutdown flush', async () => {
   assert.equal(persistence.pendingCount(), 0);
 });
 
-test('reloads the current version and retries after a version conflict', async () => {
+test('rejects a stale queued revision without overwriting newer content', async () => {
   const Note = createFakeNote();
+  Note.state.content = 'newer server content';
   Note.state.contentVersion = 1;
+  const conflicts = [];
   const persisted = [];
   const persistence = createNotePersistence({
     Note,
     debounceMs: 5,
     maxWaitMs: 100,
     logger: silentLogger,
-    onPersisted: (id, version) => persisted.push(version)
+    onConflict: (id, result) => conflicts.push({ id, ...result }),
+    onPersisted: (id) => persisted.push(id)
   });
 
-  persistence.queue(noteId(), 'socket content', 0);
+  persistence.queue(noteId(), 'stale socket content', 0, {
+    sourceKey: 'user-a:client-a',
+    sourceSocketId: 'socket-a',
+    clientEditId: 1
+  });
 
-  await waitFor(() => persisted.length === 1);
-
-  assert.equal(Note.calls.length, 2);
-  assert.deepEqual(Note.calls[0].filter.$or, [
-    { contentVersion: 0 },
-    { contentVersion: { $exists: false } }
-  ]);
-  assert.equal(Note.calls[1].filter.contentVersion, 1);
-  assert.equal(Note.state.content, 'socket content');
-  assert.equal(Note.state.contentVersion, 2);
-  assert.deepEqual(persisted, [2]);
+  await waitFor(() => conflicts.length === 1);
+  assert.equal(Note.calls.length, 1);
+  assert.equal(conflicts[0].contentVersion, 1);
+  assert.equal(conflicts[0].sourceSocketId, 'socket-a');
+  assert.equal(conflicts[0].clientEditId, 1);
+  assert.equal(Note.state.content, 'newer server content');
+  assert.equal(Note.state.contentVersion, 1);
+  assert.deepEqual(persisted, []);
+  assert.equal(persistence.pendingCount(), 0);
 
   const flushed = await persistence.flushAll();
   assert.equal(flushed.ok, true);
+});
+
+test('does not retry a permanent version conflict indefinitely', async () => {
+  const Note = createFakeNote();
+  Note.state.content = 'external content';
+  Note.state.contentVersion = 3;
+  let conflicts = 0;
+  const persistence = createNotePersistence({
+    Note,
+    debounceMs: 1,
+    maxWaitMs: 50,
+    retryBaseMs: 1,
+    maxAttempts: 10,
+    logger: silentLogger,
+    onConflict: () => { conflicts += 1; }
+  });
+
+  persistence.queue(noteId(), 'stale', 2);
+
+  await waitFor(() => conflicts === 1);
+  await delay(50);
+  assert.equal(conflicts, 1);
+  assert.equal(Note.calls.length, 1);
+  assert.equal(persistence.pendingCount(), 0);
+});
+
+test('rejects out-of-order edits from the same client', async () => {
+  const Note = createFakeNote();
+  const persistence = createNotePersistence({
+    Note,
+    debounceMs: 10,
+    maxWaitMs: 100,
+    logger: silentLogger
+  });
+
+  const first = persistence.queue(noteId(), 'newer', 0, {
+    sourceKey: 'user-a:client-a',
+    clientEditId: 2
+  });
+  const second = persistence.queue(noteId(), 'older', 0, {
+    sourceKey: 'user-a:client-a',
+    clientEditId: 1
+  });
+  const duplicate = persistence.queue(noteId(), 'newer', 0, {
+    sourceKey: 'user-a:client-a',
+    clientEditId: 2
+  });
+
+  assert.deepEqual(first, { ok: true });
+  assert.equal(second.ok, false);
+  assert.equal(second.code, 'STALE_EDIT');
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.duplicate, true);
+
+  const flushed = await persistence.flushAll();
+  assert.equal(flushed.ok, true);
+  assert.equal(Note.state.content, 'newer');
+});
+
+test('rejects a different concurrent writer for the same note', async () => {
+  const Note = createFakeNote();
+  const persistence = createNotePersistence({
+    Note,
+    debounceMs: 10_000,
+    maxWaitMs: 1000,
+    logger: silentLogger
+  });
+
+  assert.deepEqual(
+    persistence.queue(noteId(), 'first writer', 0, { sourceKey: 'user-a:client-a' }),
+    { ok: true }
+  );
+  const second = persistence.queue(noteId(), 'second writer', 0, { sourceKey: 'user-b:client-b' });
+
+  assert.equal(second.ok, false);
+  assert.equal(second.code, 'WRITE_IN_PROGRESS');
+  assert.equal(second.contentVersion, 0);
+
+  const flushed = await persistence.flushAll();
+  assert.equal(flushed.ok, true);
+  assert.equal(Note.state.content, 'first writer');
+});
+
+test('retries newer same-client content after an in-flight conflict', async () => {
+  let releaseFirstSave;
+  let firstSaveStarted;
+  const firstSaveGate = new Promise((resolve) => {
+    releaseFirstSave = resolve;
+  });
+  const firstSaveStartedPromise = new Promise((resolve) => {
+    firstSaveStarted = resolve;
+  });
+
+  const Note = createFakeNote({
+    async onUpdate(callNumber, state) {
+      if (callNumber === 1) {
+        firstSaveStarted();
+        await firstSaveGate;
+        state.content = 'external content';
+        state.contentVersion = 1;
+      }
+    }
+  });
+  const persisted = [];
+  const conflicts = [];
+  const persistence = createNotePersistence({
+    Note,
+    debounceMs: 5,
+    maxWaitMs: 100,
+    logger: silentLogger,
+    onPersisted: (id, result) => persisted.push(result),
+    onConflict: (id, result) => conflicts.push(result)
+  });
+
+  persistence.queue(noteId(), 'first local content', 0, {
+    sourceKey: 'user-a:client-a',
+    clientEditId: 1
+  });
+  await firstSaveStartedPromise;
+
+  persistence.queue(noteId(), 'newer local content', 1, {
+    sourceKey: 'user-a:client-a',
+    clientEditId: 2
+  });
+  releaseFirstSave();
+
+  await waitFor(() => persisted.length === 1);
+  await waitFor(() => persistence.pendingCount() === 0);
+
+  assert.deepEqual(conflicts, []);
+  assert.equal(Note.state.content, 'newer local content');
+  assert.equal(Note.state.contentVersion, 2);
+  assert.equal(persisted[0].content, 'newer local content');
+  assert.equal(persisted[0].contentVersion, 2);
 });

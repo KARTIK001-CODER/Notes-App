@@ -273,11 +273,11 @@ test('allows the owner and a collaborator to join a private note', async () => {
 
   assert.deepEqual(
     await emitAck(owner, 'join-note', note._id),
-    { ok: true, readOnly: false }
+    { ok: true, readOnly: false, contentVersion: 0 }
   );
   assert.deepEqual(
     await emitAck(collaborator, 'join-note', note._id),
-    { ok: true, readOnly: false }
+    { ok: true, readOnly: false, contentVersion: 0 }
   );
 });
 
@@ -287,7 +287,7 @@ test('allows an authenticated user to join a public note read-only', async () =>
 
   const response = await emitAck(stranger, 'join-note', note._id);
 
-  assert.deepEqual(response, { ok: true, readOnly: true });
+  assert.deepEqual(response, { ok: true, readOnly: true, contentVersion: 0 });
 });
 
 test('rejects edits from an authenticated non-collaborator to a public note', async () => {
@@ -301,7 +301,8 @@ test('rejects edits from an authenticated non-collaborator to a public note', as
 
   const response = await emitAck(stranger, 'note-edit', {
     noteId: note._id,
-    content: 'unauthorized public edit'
+    content: 'unauthorized public edit',
+    contentVersion: 0
   });
 
   assert.deepEqual(response, { ok: false, code: 'FORBIDDEN' });
@@ -320,7 +321,8 @@ test('rejects unauthorized edits to a private note without broadcasting or persi
 
   const response = await emitAck(stranger, 'note-edit', {
     noteId: note._id,
-    content: 'unauthorized private edit'
+    content: 'unauthorized private edit',
+    contentVersion: 0
   });
 
   assert.deepEqual(response, { ok: false, code: 'FORBIDDEN' });
@@ -343,17 +345,26 @@ test('allows owner edits, broadcasts them, and persists the latest debounced con
   await emitAck(collaborator, 'join-note', note._id);
 
   const [first, second] = await Promise.all([
-    emitAck(owner, 'note-edit', { noteId: note._id, content: 'first edit' }),
-    emitAck(owner, 'note-edit', { noteId: note._id, content: 'second edit' })
+    emitAck(owner, 'note-edit', {
+      noteId: note._id,
+      content: 'first edit',
+      contentVersion: 0,
+      clientEditId: 1
+    }),
+    emitAck(owner, 'note-edit', {
+      noteId: note._id,
+      content: 'second edit',
+      contentVersion: 0,
+      clientEditId: 2
+    })
   ]);
 
   assert.deepEqual(first, { ok: true });
   assert.deepEqual(second, { ok: true });
 
-  await waitFor(() => updates.length === 2);
-  assert.deepEqual(updates, ['first edit', 'second edit']);
-
   await waitFor(() => persistenceCalls.length === 1);
+  await waitFor(() => updates.length === 1);
+  assert.deepEqual(updates, ['second edit']);
   await waitFor(() => note.content === 'second edit');
   assert.equal(persistenceCalls[0].content, 'second edit');
 });
@@ -371,12 +382,13 @@ test('allows an authorized collaborator to edit and persist content', async () =
   const updatePromise = waitForEvent(owner, 'note-update');
   const response = await emitAck(collaborator, 'note-edit', {
     noteId: note._id,
-    content: 'collaborator edit'
+    content: 'collaborator edit',
+    contentVersion: 0
   });
   const update = await updatePromise;
 
   assert.deepEqual(response, { ok: true });
-  assert.deepEqual(update, { content: 'collaborator edit' });
+  assert.deepEqual(update, { content: 'collaborator edit', contentVersion: 1 });
 
   await waitFor(() => persistenceCalls.length === 1);
   assert.equal(persistenceCalls[0].content, 'collaborator edit');
@@ -406,11 +418,12 @@ test('stops broadcasting to previously public viewers after a note becomes priva
 
   const response = await emitAck(owner, 'note-edit', {
     noteId: note._id,
-    content: 'now private'
+    content: 'now private',
+    contentVersion: 0
   });
 
   assert.deepEqual(response, { ok: true });
-  assert.deepEqual(await collaboratorUpdate, { content: 'now private' });
+  assert.deepEqual(await collaboratorUpdate, { content: 'now private', contentVersion: 1 });
   await strangerUpdate;
   await strangerRevoked;
 
@@ -434,7 +447,8 @@ test('revokes an already-connected collaborator after access is removed', async 
   const noUpdate = expectNoEvent(collaborator, 'note-update');
   const editResponse = await emitAck(collaborator, 'note-edit', {
     noteId: note._id,
-    content: 'removed collaborator edit'
+    content: 'removed collaborator edit',
+    contentVersion: 0
   });
   await revoked;
   await noUpdate;
@@ -447,6 +461,145 @@ test('revokes an already-connected collaborator after access is removed', async 
   assert.ok(roomMembers.every((member) => member.id !== collaborator.id));
 });
 
+test('rejects a stale content revision without broadcasting or persisting', async () => {
+  const ownerId = randomId();
+  const note = createNote({ owner: ownerId, content: 'current', contentVersion: 2 });
+  const owner = await connectAs(ownerId);
+
+  await emitAck(owner, 'join-note', note._id);
+
+  const noUpdate = expectNoEvent(owner, 'note-update');
+  const response = await emitAck(owner, 'note-edit', {
+    noteId: note._id,
+    content: 'stale content',
+    contentVersion: 1
+  });
+
+  assert.deepEqual(response, {
+    ok: false,
+    code: 'VERSION_CONFLICT',
+    contentVersion: 2
+  });
+  await noUpdate;
+  await delay(DEBOUNCE_MS + 50);
+  assert.equal(persistenceCalls.length, 0);
+  assert.equal(note.content, 'current');
+  assert.equal(note.contentVersion, 2);
+});
+
+test('reports a persistence conflict when another writer wins the same revision', async () => {
+  const ownerId = randomId();
+  const note = createNote({ owner: ownerId });
+  const owner = await connectAs(ownerId);
+
+  await emitAck(owner, 'join-note', note._id);
+
+  const conflictPromise = waitForEvent(owner, 'note-save-conflict');
+  const response = await emitAck(owner, 'note-edit', {
+    noteId: note._id,
+    content: 'socket content',
+    contentVersion: 0
+  });
+  assert.deepEqual(response, { ok: true });
+
+  note.content = 'external REST content';
+  note.contentVersion = 1;
+
+  assert.deepEqual(await conflictPromise, {
+    code: 'VERSION_CONFLICT',
+    contentVersion: 1
+  });
+  await delay(DEBOUNCE_MS + 50);
+  assert.equal(note.content, 'external REST content');
+  assert.equal(note.contentVersion, 1);
+});
+
+test('rejects a concurrent writer while another client write is pending', async () => {
+  const ownerId = randomId();
+  const collaboratorId = randomId();
+  const note = createNote({ owner: ownerId, collaborators: [collaboratorId] });
+  const owner = await connectAs(ownerId);
+  const collaborator = await connectAs(collaboratorId);
+
+  await emitAck(owner, 'join-note', note._id);
+  await emitAck(collaborator, 'join-note', note._id);
+
+  const ownerResponse = await emitAck(owner, 'note-edit', {
+    noteId: note._id,
+    content: 'owner pending content',
+    contentVersion: 0
+  });
+  const collaboratorResponse = await emitAck(collaborator, 'note-edit', {
+    noteId: note._id,
+    content: 'collaborator content',
+    contentVersion: 0
+  });
+
+  assert.deepEqual(ownerResponse, { ok: true });
+  assert.equal(collaboratorResponse.ok, false);
+  assert.equal(collaboratorResponse.code, 'WRITE_IN_PROGRESS');
+  assert.equal(collaboratorResponse.contentVersion, 0);
+
+  await waitFor(() => note.content === 'owner pending content');
+  assert.equal(note.contentVersion, 1);
+  assert.equal(persistenceCalls.length, 1);
+});
+
+test('returns the persisted revision to the writer after the save', async () => {
+  const ownerId = randomId();
+  const note = createNote({ owner: ownerId });
+  const owner = await connectAs(ownerId);
+
+  await emitAck(owner, 'join-note', note._id);
+  const saved = waitForEvent(owner, 'note-saved');
+  await emitAck(owner, 'note-edit', {
+    noteId: note._id,
+    content: 'revision tracked',
+    contentVersion: 0,
+    clientId: 'client-a',
+    clientEditId: 7
+  });
+
+  assert.deepEqual(await saved, { contentVersion: 1, clientEditId: 7 });
+  assert.equal(note.contentVersion, 1);
+});
+
+test('accepts a same-client follow-up that trails its own completed save', async () => {
+  const ownerId = randomId();
+  const note = createNote({ owner: ownerId });
+  const owner = await connectAs(ownerId);
+
+  await emitAck(owner, 'join-note', note._id);
+  const firstSaved = waitForEvent(owner, 'note-saved');
+  await emitAck(owner, 'note-edit', {
+    noteId: note._id,
+    content: 'first',
+    contentVersion: 0,
+    clientId: 'client-a',
+    clientEditId: 1
+  });
+  assert.deepEqual(await firstSaved, { contentVersion: 1, clientEditId: 1 });
+
+  const conflicts = [];
+  owner.on('note-save-conflict', (payload) => conflicts.push(payload));
+
+  const secondSaved = waitForEvent(owner, 'note-saved');
+  const response = await emitAck(owner, 'note-edit', {
+    noteId: note._id,
+    content: 'second',
+    contentVersion: 0,
+    clientId: 'client-a',
+    clientEditId: 2
+  });
+
+  assert.deepEqual(response, { ok: true });
+  assert.deepEqual(await secondSaved, { contentVersion: 2, clientEditId: 2 });
+  await delay(DEBOUNCE_MS + 50);
+  assert.deepEqual(conflicts, []);
+  assert.equal(note.content, 'second');
+  assert.equal(note.contentVersion, 2);
+});
+
 test('rejects malformed and oversized note-edit payloads', async () => {
   const ownerId = randomId();
   const note = createNote({ owner: ownerId });
@@ -457,9 +610,13 @@ test('rejects malformed and oversized note-edit payloads', async () => {
   const cases = [
     [null, 'INVALID_PAYLOAD'],
     [[], 'INVALID_PAYLOAD'],
-    [{ noteId: 'not-an-object-id', content: 'text' }, 'INVALID_NOTE_ID'],
-    [{ noteId: note._id, content: 42 }, 'INVALID_PAYLOAD'],
-    [{ noteId: note._id, content: 'x'.repeat(CONTENT_LIMIT_BYTES + 1) }, 'CONTENT_TOO_LARGE']
+    [{ noteId: 'not-an-object-id', content: 'text', contentVersion: 0 }, 'INVALID_NOTE_ID'],
+    [{ noteId: note._id, content: 42, contentVersion: 0 }, 'INVALID_PAYLOAD'],
+    [{ noteId: note._id, content: 'text' }, 'VERSION_REQUIRED'],
+    [{ noteId: note._id, content: 'text', contentVersion: -1 }, 'VERSION_REQUIRED'],
+    [{ noteId: note._id, content: 'x'.repeat(CONTENT_LIMIT_BYTES + 1), contentVersion: 0 }, 'CONTENT_TOO_LARGE'],
+    [{ noteId: note._id, content: 'text', contentVersion: 0, clientId: 'bad client id' }, 'INVALID_PAYLOAD'],
+    [{ noteId: note._id, content: 'text', contentVersion: 0, clientEditId: -1 }, 'INVALID_PAYLOAD']
   ];
 
   for (const [payload, expectedCode] of cases) {
