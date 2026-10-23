@@ -31,6 +31,42 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
+// Get all public notes (no authentication required)
+router.get('/public', async (req, res) => {
+  try {
+    const notes = await Note.find({ isPublic: true })
+      .select('_id title content isPublic updatedAt owner')
+      .sort({ updatedAt: -1 });
+    res.json(notes);
+  } catch (err) {
+    console.error('Error fetching public notes:', err);
+    res.status(500).send('Server error');
+  }
+});
+
+// Public access to note (no authentication required)
+router.get('/public/:id', async (req, res) => {
+  try {
+    const note = await Note.findById(req.params.id);
+    if (!note) return res.status(404).json({ message: 'Note not found' });
+    
+    if (!note.isPublic) {
+      return res.status(403).json({ message: 'This note is not publicly accessible' });
+    }
+
+    res.json({
+      _id: note._id,
+      title: note.title,
+      content: note.content,
+      isPublic: true,
+      updatedAt: note.updatedAt
+    });
+  } catch (err) {
+    console.error('Error in public note access:', err);
+    res.status(500).send('Server error');
+  }
+});
+
 // Get single note
 router.get('/:id', auth, async (req, res) => {
   try {
@@ -102,33 +138,10 @@ router.delete('/:id', auth, async (req, res) => {
   try {
     const note = await Note.findById(req.params.id);
     if (!note) return res.status(404).json({ message: 'Note not found' });
-    if (note.owner.toString() !== req.user.id) return res.status(403).json({ message: 'Only owner can delete' });
-    await note.remove();
+    if (note.owner.toString() !== req.user.id.toString()) return res.status(403).json({ message: 'Only owner can delete' });
+    await note.deleteOne();
     res.json({ message: 'Deleted' });
   } catch (err) {
-    res.status(500).send('Server error');
-  }
-});
-
-// Public access to note (no authentication required)
-router.get('/public/:id', async (req, res) => {
-  try {
-    const note = await Note.findById(req.params.id);
-    if (!note) return res.status(404).json({ message: 'Note not found' });
-    
-    if (!note.isPublic) {
-      return res.status(403).json({ message: 'This note is not publicly accessible' });
-    }
-
-    res.json({
-      _id: note._id,
-      title: note.title,
-      content: note.content,
-      isPublic: true,
-      updatedAt: note.updatedAt
-    });
-  } catch (err) {
-    console.error('Error in public note access:', err);
     res.status(500).send('Server error');
   }
 });
