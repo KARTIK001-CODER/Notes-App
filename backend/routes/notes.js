@@ -66,9 +66,12 @@ router.get('/', auth, async (req, res) => {
 router.get('/public', async (req, res) => {
   try {
     const notes = await Note.find({ isPublic: true })
-      .select('_id title content isPublic updatedAt owner')
+      .select('_id title content contentVersion isPublic updatedAt owner')
       .sort({ updatedAt: -1 });
-    res.json(notes);
+    res.json(notes.map((note) => ({
+      ...note.toObject(),
+      contentVersion: normalizeContentVersion(note.contentVersion)
+    })));
   } catch (err) {
     console.error('Error fetching public notes:', err);
     res.status(500).send('Server error');
@@ -89,6 +92,7 @@ router.get('/public/:id', async (req, res) => {
       _id: note._id,
       title: note.title,
       content: note.content,
+      contentVersion: normalizeContentVersion(note.contentVersion),
       isPublic: true,
       updatedAt: note.updatedAt
     });
@@ -111,7 +115,9 @@ router.get('/:id', auth, async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    res.json(note);
+    const response = note.toObject();
+    response.contentVersion = normalizeContentVersion(note.contentVersion);
+    res.json(response);
   } catch (err) {
     console.error('Error in get note:', err);
     res.status(500).send('Server error');
@@ -215,14 +221,6 @@ router.put('/:id', auth, async (req, res) => {
         code: 'VERSION_CONFLICT',
         message: 'Note content has changed since it was loaded',
         contentVersion: latestVersion
-      });
-    }
-
-    if (hasPendingContentWrite(req, note._id)) {
-      return res.status(409).json({
-        code: 'WRITE_IN_PROGRESS',
-        message: 'A realtime content write is pending',
-        contentVersion: updated.contentVersion
       });
     }
 

@@ -166,6 +166,14 @@ async function putNote(noteId, body, token, baseUrl = apiUrl) {
   return { status: response.status, data };
 }
 
+async function getNote(noteId, token) {
+  const response = await fetch(`${apiUrl}/api/notes/${noteId}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  const data = await response.json();
+  return { status: response.status, data };
+}
+
 async function createNote(overrides = {}) {
   return Note.create({
     title: 'Test note',
@@ -293,7 +301,8 @@ test('persists accepted socket edits and reads them back from MongoDB', async (t
   const saved = waitForEvent(owner, 'note-saved');
   const response = await emitAck(owner, 'note-edit', {
     noteId: note.id,
-    content: '<p>persisted from socket</p>'
+    content: '<p>persisted from socket</p>',
+    contentVersion: 0
   });
   const status = await saved;
 
@@ -317,9 +326,24 @@ test('persists the latest of rapid successive socket edits', async (t) => {
   const saved = waitForEvent(owner, 'note-saved');
 
   const responses = await Promise.all([
-    emitAck(owner, 'note-edit', { noteId: note.id, content: 'first' }),
-    emitAck(owner, 'note-edit', { noteId: note.id, content: 'second' }),
-    emitAck(owner, 'note-edit', { noteId: note.id, content: 'third' })
+    emitAck(owner, 'note-edit', {
+      noteId: note.id,
+      content: 'first',
+      contentVersion: 0,
+      clientEditId: 1
+    }),
+    emitAck(owner, 'note-edit', {
+      noteId: note.id,
+      content: 'second',
+      contentVersion: 0,
+      clientEditId: 2
+    }),
+    emitAck(owner, 'note-edit', {
+      noteId: note.id,
+      content: 'third',
+      contentVersion: 0,
+      clientEditId: 3
+    })
   ]);
 
   assert.ok(responses.every((response) => response.ok === true));
@@ -327,6 +351,88 @@ test('persists the latest of rapid successive socket edits', async (t) => {
 
   const stored = await waitForDbNote(note.id, (doc) => doc.content === 'third');
   assert.equal(stored.content, 'third');
+});
+
+test('accepts a same-client follow-up that trails its own completed save', async (t) => {
+  if (!requireMongo(t)) return;
+
+  const ownerId = randomId();
+  const note = await createNote({ owner: ownerId });
+  const owner = await connectAs(ownerId);
+
+  await emitAck(owner, 'join-note', note.id);
+  const firstSaved = waitForEvent(owner, 'note-saved');
+  await emitAck(owner, 'note-edit', {
+    noteId: note.id,
+    content: 'first',
+    contentVersion: 0,
+    clientId: 'client-a',
+    clientEditId: 1
+  });
+  assert.equal((await firstSaved).contentVersion, 1);
+
+  const conflicts = [];
+  owner.on('note-save-conflict', (payload) => conflicts.push(payload));
+
+  const secondSaved = waitForEvent(owner, 'note-saved');
+  const response = await emitAck(owner, 'note-edit', {
+    noteId: note.id,
+    content: 'second',
+    contentVersion: 0,
+    clientId: 'client-a',
+    clientEditId: 2
+  });
+
+  assert.deepEqual(response, { ok: true });
+  assert.deepEqual(await secondSaved, { contentVersion: 2, clientEditId: 2 });
+
+  const stored = await waitForDbNote(note.id, (doc) => doc.content === 'second');
+  assert.equal(stored.contentVersion, 2);
+  assert.deepEqual(conflicts, []);
+});
+
+test('rejoining after a socket reconnect resumes from the current revision', async (t) => {
+  if (!requireMongo(t)) return;
+
+  const ownerId = randomId();
+  const note = await createNote({ owner: ownerId });
+  const owner = await connectAs(ownerId);
+
+  const firstJoin = await emitAck(owner, 'join-note', note.id);
+  assert.equal(firstJoin.ok, true);
+  assert.equal(firstJoin.contentVersion, 0);
+
+  const firstSaved = waitForEvent(owner, 'note-saved');
+  await emitAck(owner, 'note-edit', {
+    noteId: note.id,
+    content: 'before reconnect',
+    contentVersion: firstJoin.contentVersion,
+    clientId: 'client-a',
+    clientEditId: 1
+  });
+  assert.equal((await firstSaved).contentVersion, 1);
+
+  owner.disconnect();
+
+  const reconnected = await connectAs(ownerId);
+  const secondJoin = await emitAck(reconnected, 'join-note', note.id);
+  assert.equal(secondJoin.ok, true);
+  assert.equal(secondJoin.contentVersion, 1);
+
+  const secondSaved = waitForEvent(reconnected, 'note-saved');
+  const response = await emitAck(reconnected, 'note-edit', {
+    noteId: note.id,
+    content: 'after reconnect',
+    contentVersion: secondJoin.contentVersion,
+    clientId: 'client-a',
+    clientEditId: 2
+  });
+
+  assert.deepEqual(response, { ok: true });
+  assert.deepEqual(await secondSaved, { contentVersion: 2, clientEditId: 2 });
+
+  const stored = await waitForDbNote(note.id, (doc) => doc.content === 'after reconnect');
+  assert.equal(stored.contentVersion, 2);
 });
 
 test('flushes pending socket writes and reports success during shutdown', async (t) => {
@@ -341,7 +447,8 @@ test('flushes pending socket writes and reports success during shutdown', async 
     await emitAck(owner, 'join-note', note.id);
     const response = await emitAck(owner, 'note-edit', {
       noteId: note.id,
-      content: 'saved during shutdown flush'
+      content: 'saved during shutdown flush',
+      contentVersion: 0
     });
     assert.deepEqual(response, { ok: true });
 
@@ -367,7 +474,8 @@ test('rejects stale REST content without overwriting newer socket content', asyn
   const saved = waitForEvent(owner, 'note-saved');
   await emitAck(owner, 'note-edit', {
     noteId: note.id,
-    content: 'socket newer content'
+    content: 'socket newer content',
+    contentVersion: 0
   });
   const status = await saved;
 
@@ -394,6 +502,106 @@ test('rejects stale REST content without overwriting newer socket content', asyn
   assert.equal(stored.contentVersion, status.contentVersion + 1);
 });
 
+test('increments the revision atomically for concurrent REST writes', async (t) => {
+  if (!requireMongo(t)) return;
+
+  const ownerId = randomId();
+  const note = await createNote({ owner: ownerId, content: 'original' });
+  const token = makeToken(ownerId);
+
+  const [first, second] = await Promise.all([
+    putNote(note.id, { content: 'first concurrent write', contentVersion: 0 }, token),
+    putNote(note.id, { content: 'second concurrent write', contentVersion: 0 }, token)
+  ]);
+
+  const statuses = [first.status, second.status].sort((a, b) => a - b);
+  assert.deepEqual(statuses, [200, 409]);
+
+  const conflict = [first, second].find((response) => response.status === 409);
+  assert.equal(conflict.data.code, 'VERSION_CONFLICT');
+  assert.equal(conflict.data.contentVersion, 1);
+
+  const stored = await Note.findById(note.id).lean();
+  assert.equal(stored.contentVersion, 1);
+  assert.ok(['first concurrent write', 'second concurrent write'].includes(stored.content));
+});
+
+test('rejects a socket write that conflicts with a concurrent REST write', async (t) => {
+  if (!requireMongo(t)) return;
+
+  const ownerId = randomId();
+  const note = await createNote({ owner: ownerId });
+  const longServer = await startLongDebounceRealtimeServer();
+
+  try {
+    const owner = await connectAs(ownerId, longServer.url);
+    await emitAck(owner, 'join-note', note.id);
+
+    const conflictPromise = waitForEvent(owner, 'note-save-conflict');
+    const socketResponse = await emitAck(owner, 'note-edit', {
+      noteId: note.id,
+      content: 'socket content',
+      contentVersion: 0,
+      clientEditId: 1
+    });
+    assert.deepEqual(socketResponse, { ok: true });
+
+    const restResponse = await putNote(note.id, {
+      content: 'REST content',
+      contentVersion: 0
+    }, makeToken(ownerId));
+    assert.equal(restResponse.status, 200);
+    assert.equal(restResponse.data.contentVersion, 1);
+
+    const flushResult = await longServer.realtime.flushAll();
+    assert.equal(flushResult.ok, true);
+
+    const conflict = await conflictPromise;
+    assert.deepEqual(conflict, {
+      code: 'VERSION_CONFLICT',
+      contentVersion: 1
+    });
+
+    const stored = await Note.findById(note.id).lean();
+    assert.equal(stored.content, 'REST content');
+    assert.equal(stored.contentVersion, 1);
+  } finally {
+    await stopRealtimeServer(longServer);
+  }
+});
+
+test('reads legacy notes without a revision and initializes it on first write', async (t) => {
+  if (!requireMongo(t)) return;
+
+  const ownerId = randomId();
+  const noteId = new mongoose.Types.ObjectId();
+  await Note.collection.insertOne({
+    _id: noteId,
+    title: 'Legacy note',
+    content: 'legacy content',
+    owner: new mongoose.Types.ObjectId(ownerId),
+    collaborators: [],
+    isPublic: false,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  });
+
+  const fetched = await getNote(noteId.toString(), makeToken(ownerId));
+  assert.equal(fetched.status, 200);
+  assert.equal(fetched.data.contentVersion, 0);
+
+  const updated = await putNote(noteId.toString(), {
+    content: 'legacy note updated',
+    contentVersion: 0
+  }, makeToken(ownerId));
+  assert.equal(updated.status, 200);
+  assert.equal(updated.data.contentVersion, 1);
+
+  const stored = await Note.findById(noteId).lean();
+  assert.equal(stored.content, 'legacy note updated');
+  assert.equal(stored.contentVersion, 1);
+});
+
 test('title-only REST updates preserve socket-persisted content', async (t) => {
   if (!requireMongo(t)) return;
 
@@ -405,7 +613,8 @@ test('title-only REST updates preserve socket-persisted content', async (t) => {
   const saved = waitForEvent(owner, 'note-saved');
   await emitAck(owner, 'note-edit', {
     noteId: note.id,
-    content: 'content that must survive'
+    content: 'content that must survive',
+    contentVersion: 0
   });
   const status = await saved;
 
@@ -447,7 +656,8 @@ test('rejects REST content while a socket write is pending', async (t) => {
     await emitAck(owner, 'join-note', note.id);
     const response = await emitAck(owner, 'note-edit', {
       noteId: note.id,
-      content: 'accepted socket content'
+      content: 'accepted socket content',
+      contentVersion: 0
     });
     assert.deepEqual(response, { ok: true });
 
@@ -480,12 +690,13 @@ test('public viewers are read-only and are removed after the note becomes privat
   const viewer = await connectAs(viewerId);
 
   const joinResponse = await emitAck(viewer, 'join-note', note.id);
-  assert.deepEqual(joinResponse, { ok: true, readOnly: true });
+  assert.deepEqual(joinResponse, { ok: true, readOnly: true, contentVersion: 0 });
   await emitAck(owner, 'join-note', note.id);
 
   const forbidden = await emitAck(viewer, 'note-edit', {
     noteId: note.id,
-    content: 'public viewer write'
+    content: 'public viewer write',
+    contentVersion: 0
   });
   assert.deepEqual(forbidden, { ok: false, code: 'FORBIDDEN' });
 
@@ -494,7 +705,11 @@ test('public viewers are read-only and are removed after the note becomes privat
   const noUpdate = expectNoEvent(viewer, 'note-update');
   const revoked = waitForEvent(viewer, 'note-access-revoked');
   const saved = waitForEvent(owner, 'note-saved');
-  await emitAck(owner, 'note-edit', { noteId: note.id, content: 'owner only now' });
+  await emitAck(owner, 'note-edit', {
+    noteId: note.id,
+    content: 'owner only now',
+    contentVersion: 0
+  });
   await saved;
   await noUpdate;
   await revoked;
@@ -523,13 +738,14 @@ test('former owners lose edit access after ownership changes', async (t) => {
   );
 
   const joinResponse = await emitAck(newOwner, 'join-note', note.id);
-  assert.deepEqual(joinResponse, { ok: true, readOnly: false });
+  assert.deepEqual(joinResponse, { ok: true, readOnly: false, contentVersion: 0 });
 
   const revoked = waitForEvent(formerOwner, 'note-access-revoked');
   const noUpdate = expectNoEvent(formerOwner, 'note-update');
   const forbidden = await emitAck(formerOwner, 'note-edit', {
     noteId: note.id,
-    content: 'former owner write'
+    content: 'former owner write',
+    contentVersion: 0
   });
   await revoked;
   await noUpdate;
@@ -537,7 +753,11 @@ test('former owners lose edit access after ownership changes', async (t) => {
   assert.deepEqual(forbidden, { ok: false, code: 'FORBIDDEN' });
 
   const saved = waitForEvent(newOwner, 'note-saved');
-  await emitAck(newOwner, 'note-edit', { noteId: note.id, content: 'new owner content' });
+  await emitAck(newOwner, 'note-edit', {
+    noteId: note.id,
+    content: 'new owner content',
+    contentVersion: 0
+  });
   await saved;
 
   const stored = await Note.findById(note.id).lean();
@@ -569,7 +789,8 @@ test('removed collaborators cannot edit or receive updates through an existing s
   const noUpdate = expectNoEvent(collaborator, 'note-update');
   const forbidden = await emitAck(collaborator, 'note-edit', {
     noteId: note.id,
-    content: 'removed collaborator write'
+    content: 'removed collaborator write',
+    contentVersion: 0
   });
   await revoked;
   await noUpdate;
@@ -577,7 +798,11 @@ test('removed collaborators cannot edit or receive updates through an existing s
   assert.deepEqual(forbidden, { ok: false, code: 'FORBIDDEN' });
 
   const saved = waitForEvent(owner, 'note-saved');
-  await emitAck(owner, 'note-edit', { noteId: note.id, content: 'owner content' });
+  await emitAck(owner, 'note-edit', {
+    noteId: note.id,
+    content: 'owner content',
+    contentVersion: 0
+  });
   await saved;
 
   const stored = await Note.findById(note.id).lean();

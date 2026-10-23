@@ -3,6 +3,7 @@ const DEFAULT_MAX_WAIT_MS = 3000;
 const DEFAULT_RETRY_BASE_MS = 250;
 const DEFAULT_RETRY_MAX_MS = 5000;
 const DEFAULT_MAX_ATTEMPTS = 5;
+const MAX_RECENT_WRITES = 1000;
 
 function normalizeVersion(value) {
   return Number.isInteger(value) && value >= 0 ? value : 0;
@@ -20,6 +21,10 @@ function versionFilter(version) {
   return { contentVersion: version };
 }
 
+function normalizeEditId(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
 function createNotePersistence({
   Note,
   debounceMs = DEFAULT_DEBOUNCE_MS,
@@ -29,7 +34,8 @@ function createNotePersistence({
   maxAttempts = DEFAULT_MAX_ATTEMPTS,
   logger = console,
   onPersisted = () => {},
-  onFailed = () => {}
+  onFailed = () => {},
+  onConflict = () => {}
 } = {}) {
   if (!Note || typeof Note.findOneAndUpdate !== 'function') {
     throw new TypeError('A Note model with findOneAndUpdate is required');
@@ -40,6 +46,7 @@ function createNotePersistence({
     : DEFAULT_MAX_ATTEMPTS;
   const states = new Map();
   const failures = new Map();
+  const recentWrites = new Map();
 
   function clearTimer(state) {
     if (state.timer) {
@@ -57,6 +64,63 @@ function createNotePersistence({
     }, Math.max(0, delay));
   }
 
+  function notify(callback, ...args) {
+    try {
+      const result = callback(...args);
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {
+          if (logger && typeof logger.error === 'function') {
+            logger.error('Failed to report note persistence event');
+          }
+        });
+      }
+    } catch {
+      if (logger && typeof logger.error === 'function') {
+        logger.error('Failed to report note persistence event');
+      }
+    }
+  }
+
+  function stateMetadata(state) {
+    return {
+      sourceKey: state.sourceKey,
+      sourceSocketId: state.sourceSocketId,
+      clientEditId: state.clientEditId
+    };
+  }
+
+  function rememberWrite(noteId, sourceKey, contentVersion) {
+    recentWrites.delete(noteId);
+    recentWrites.set(noteId, { sourceKey, contentVersion });
+    if (recentWrites.size > MAX_RECENT_WRITES) {
+      const oldestNoteId = recentWrites.keys().next().value;
+      recentWrites.delete(oldestNoteId);
+    }
+  }
+
+  function canContinue(noteId, baseVersion, sourceKey) {
+    const normalizedBase = normalizeVersion(baseVersion);
+    const state = states.get(noteId);
+
+    if (
+      state
+      && state.sourceKey === sourceKey
+      && (
+        normalizedBase === state.baseVersion
+        || normalizedBase + 1 === state.baseVersion
+      )
+    ) {
+      return true;
+    }
+
+    const recent = recentWrites.get(noteId);
+    return Boolean(
+      recent
+      && recent.sourceKey === sourceKey
+      && normalizedBase + 1 === recent.contentVersion
+    );
+  }
+
   function reportFailure(state, error) {
     clearTimer(state);
     state.inFlight = false;
@@ -68,20 +132,29 @@ function createNotePersistence({
       logger.error('Failed to persist debounced note update');
     }
 
-    try {
-      onFailed(state.noteId);
-    } catch {
-      if (logger && typeof logger.error === 'function') {
-        logger.error('Failed to report note persistence failure');
-      }
-    }
+    notify(onFailed, state.noteId, {
+      ...stateMetadata(state),
+      error
+    });
   }
 
-  async function persist(state) {
+  function reportConflict(state, contentVersion) {
+    clearTimer(state);
+    state.inFlight = false;
+    state.dirty = false;
+    states.delete(state.noteId);
+
+    notify(onConflict, state.noteId, {
+      ...stateMetadata(state),
+      contentVersion: normalizeVersion(contentVersion)
+    });
+  }
+
+  async function persist(state, content, baseVersion) {
     const saved = await Note.findOneAndUpdate(
-      { _id: state.noteId, ...versionFilter(normalizeVersion(state.baseVersion)) },
+      { _id: state.noteId, ...versionFilter(normalizeVersion(baseVersion)) },
       {
-        $set: { content: state.content, updatedAt: new Date() },
+        $set: { content, updatedAt: new Date() },
         $inc: { contentVersion: 1 }
       },
       { new: true }
@@ -108,45 +181,46 @@ function createNotePersistence({
     clearTimer(state);
     state.inFlight = true;
     const generation = state.generation;
+    const content = state.content;
+    const baseVersion = state.baseVersion;
+    const metadata = stateMetadata(state);
     state.dirty = false;
 
     try {
-      const result = await persist(state);
+      const result = await persist(state, content, baseVersion);
 
       if (result.conflictVersion !== undefined) {
-        state.conflictAttempts += 1;
-        if (state.conflictAttempts >= attemptLimit) {
-          reportFailure(state, new Error('Note persistence conflict limit reached'));
+        const currentVersion = normalizeVersion(result.conflictVersion);
+        if (state.generation !== generation && currentVersion === state.baseVersion) {
+          state.inFlight = false;
+          state.dirty = true;
+          schedule(state, 0);
           return;
         }
 
-        state.baseVersion = result.conflictVersion;
-        state.inFlight = false;
-        state.dirty = true;
-        schedule(state, 0);
+        reportConflict(state, currentVersion);
         return;
       }
 
       const contentVersion = normalizeVersion(result.contentVersion);
       state.attempts = 0;
-      state.conflictAttempts = 0;
       state.inFlight = false;
+      rememberWrite(noteId, state.sourceKey, contentVersion);
 
-      try {
-        onPersisted(noteId, contentVersion);
-      } catch {
-        if (logger && typeof logger.error === 'function') {
-          logger.error('Failed to report note persistence success');
-        }
-      }
-
-      if (state.generation !== generation) {
+      if (state.generation === generation) {
+        states.delete(noteId);
+      } else {
         state.baseVersion = contentVersion;
         state.firstQueuedAt = Date.now();
+        state.dirty = true;
         schedule(state, debounceMs);
-      } else {
-        states.delete(noteId);
       }
+
+      notify(onPersisted, noteId, {
+        ...metadata,
+        content,
+        contentVersion
+      });
     } catch (err) {
       state.dirty = true;
       state.inFlight = false;
@@ -168,35 +242,85 @@ function createNotePersistence({
     }
   }
 
-  function queue(noteId, content, baseVersion = 0) {
-    let state = states.get(noteId);
+  function queue(noteId, content, baseVersion = 0, meta = {}) {
     const now = Date.now();
+    let normalizedBaseVersion = normalizeVersion(baseVersion);
+    const clientEditId = normalizeEditId(meta.clientEditId);
+    const sourceKey = typeof meta.sourceKey === 'string' && meta.sourceKey
+      ? meta.sourceKey
+      : 'default';
+    const sourceSocketId = typeof meta.sourceSocketId === 'string' ? meta.sourceSocketId : null;
+    let state = states.get(noteId);
 
-    if (!state) {
-      state = {
-        noteId,
-        content,
-        baseVersion: normalizeVersion(baseVersion),
-        dirty: true,
-        inFlight: false,
-        generation: 1,
-        firstQueuedAt: now,
-        attempts: 0,
-        conflictAttempts: 0,
-        timer: null
-      };
-      states.set(noteId, state);
-    } else {
+    if (state) {
+      if (state.sourceKey !== sourceKey) {
+        return { ok: false, code: 'WRITE_IN_PROGRESS', contentVersion: state.baseVersion };
+      }
+
+      if (normalizedBaseVersion + 1 === state.baseVersion) {
+        normalizedBaseVersion = state.baseVersion;
+      }
+
+      if (clientEditId !== null && state.clientEditId !== null) {
+        if (clientEditId < state.clientEditId) {
+          return { ok: false, code: 'STALE_EDIT', contentVersion: state.baseVersion };
+        }
+        if (clientEditId === state.clientEditId) {
+          if (content === state.content) {
+            state.sourceSocketId = sourceSocketId;
+            return { ok: true, duplicate: true };
+          }
+          return { ok: false, code: 'STALE_EDIT', contentVersion: state.baseVersion };
+        }
+      }
+
+      if (normalizedBaseVersion < state.baseVersion) {
+        return { ok: false, code: 'STALE_EDIT', contentVersion: state.baseVersion };
+      }
+
       if (!state.dirty) state.firstQueuedAt = now;
       state.content = content;
+      state.baseVersion = Math.max(state.baseVersion, normalizedBaseVersion);
+      state.clientEditId = clientEditId ?? state.clientEditId;
+      state.sourceSocketId = sourceSocketId ?? state.sourceSocketId;
       state.dirty = true;
       state.generation += 1;
+
+      if (state.inFlight) return { ok: true };
+
+      const dueAt = Math.min(now + debounceMs, state.firstQueuedAt + maxWaitMs);
+      schedule(state, dueAt - now);
+      return { ok: true };
     }
 
-    if (state.inFlight) return;
+    const recent = recentWrites.get(noteId);
+    if (
+      recent
+      && recent.sourceKey === sourceKey
+      && normalizedBaseVersion + 1 === recent.contentVersion
+    ) {
+      normalizedBaseVersion = recent.contentVersion;
+    }
+
+    state = {
+      noteId,
+      content,
+      baseVersion: normalizedBaseVersion,
+      sourceKey,
+      sourceSocketId,
+      clientEditId,
+      dirty: true,
+      inFlight: false,
+      generation: 1,
+      firstQueuedAt: now,
+      attempts: 0,
+      timer: null
+    };
+    states.set(noteId, state);
 
     const dueAt = Math.min(now + debounceMs, state.firstQueuedAt + maxWaitMs);
     schedule(state, dueAt - now);
+    return { ok: true };
   }
 
   async function flushAll() {
@@ -238,6 +362,7 @@ function createNotePersistence({
 
   return {
     queue,
+    canContinue,
     flushAll,
     pendingCount,
     hasPending
