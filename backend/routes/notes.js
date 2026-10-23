@@ -4,6 +4,37 @@ const auth = require('../middleware/authMiddleware');
 const Note = require('../models/Note');
 const crypto = require('crypto');
 
+function normalizeContentVersion(value) {
+  return Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+function accessFilter(userId) {
+  return { $or: [{ owner: userId }, { collaborators: userId }] };
+}
+
+function contentVersionFilter(version) {
+  if (version === 0) {
+    return {
+      $or: [
+        { contentVersion: 0 },
+        { contentVersion: { $exists: false } }
+      ]
+    };
+  }
+  return { contentVersion: version };
+}
+
+async function findCurrentVersion(noteId) {
+  const note = await Note.findById(noteId).select('contentVersion').lean();
+  return note ? normalizeContentVersion(note.contentVersion) : null;
+}
+
+function hasPendingContentWrite(req, noteId) {
+  const persistence = req.app.locals?.notePersistence;
+  if (!persistence || typeof persistence.hasPending !== 'function') return false;
+  return persistence.hasPending(String(noteId).toLowerCase());
+}
+
 // Create note
 router.post('/', auth, async (req, res) => {
   const { title, content } = req.body;
@@ -73,32 +104,11 @@ router.get('/:id', auth, async (req, res) => {
     const note = await Note.findById(req.params.id);
     if (!note) return res.status(404).json({ message: 'Note not found' });
 
-    // Debug logging
-    console.log('Debug - Note access check:');
-    console.log('Note ID:', req.params.id);
-    console.log('Note owner:', note.owner.toString());
-    console.log('Request user ID:', req.user.id);
-    console.log('User ID type:', typeof req.user.id);
-    console.log('Owner ID type:', typeof note.owner.toString());
-    console.log('Are they equal?', note.owner.toString() === req.user.id);
-    console.log('Collaborators:', note.collaborators);
-    console.log('User in collaborators?', note.collaborators.includes(req.user.id));
-
-    // basic access control - fix ObjectId comparison
     const isOwner = note.owner.toString() === req.user.id.toString();
     const isCollaborator = note.collaborators.some(collab => collab.toString() === req.user.id.toString());
-    
+
     if (!isOwner && !isCollaborator) {
-      return res.status(403).json({ 
-        message: 'Access denied',
-        debug: {
-          noteOwner: note.owner.toString(),
-          userId: req.user.id.toString(),
-          isOwner,
-          isCollaborator,
-          collaborators: note.collaborators.map(c => c.toString())
-        }
-      });
+      return res.status(403).json({ message: 'Access denied' });
     }
 
     res.json(note);
@@ -111,23 +121,112 @@ router.get('/:id', auth, async (req, res) => {
 
 // Update note (save)
 router.put('/:id', auth, async (req, res) => {
-  const { title, content } = req.body;
   try {
-    let note = await Note.findById(req.params.id);
+    const note = await Note.findById(req.params.id);
     if (!note) return res.status(404).json({ message: 'Note not found' });
-    // Fix ObjectId comparison for update route
+
     const isOwner = note.owner.toString() === req.user.id.toString();
     const isCollaborator = note.collaborators.some(collab => collab.toString() === req.user.id.toString());
-    
+
     if (!isOwner && !isCollaborator) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    note.title = title ?? note.title;
-    note.content = content ?? note.content;
-    note.updatedAt = new Date();
-    await note.save();
-    res.json(note);
+    const updates = {};
+    if (Object.prototype.hasOwnProperty.call(req.body, 'title')) {
+      updates.title = req.body.title;
+    }
+
+    const hasContent = Object.prototype.hasOwnProperty.call(req.body, 'content');
+    if (!hasContent) {
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ message: 'No supported fields to update' });
+      }
+
+      updates.updatedAt = new Date();
+      const updated = await Note.findOneAndUpdate(
+        { _id: req.params.id, $and: [accessFilter(req.user.id)] },
+        { $set: updates },
+        { new: true, runValidators: true }
+      );
+
+      if (!updated) {
+        const exists = await Note.exists({ _id: req.params.id });
+        return exists
+          ? res.status(403).json({ message: 'Access denied' })
+          : res.status(404).json({ message: 'Note not found' });
+      }
+
+      return res.json(updated);
+    }
+
+    if (typeof req.body.content !== 'string') {
+      return res.status(400).json({ code: 'INVALID_CONTENT', message: 'Content must be a string' });
+    }
+
+    const contentVersion = req.body.contentVersion;
+    const currentVersion = normalizeContentVersion(note.contentVersion);
+
+    if (!Number.isInteger(contentVersion) || contentVersion < 0) {
+      return res.status(428).json({
+        code: 'VERSION_REQUIRED',
+        message: 'contentVersion is required when updating content',
+        contentVersion: currentVersion
+      });
+    }
+
+    if (contentVersion !== currentVersion) {
+      return res.status(409).json({
+        code: 'VERSION_CONFLICT',
+        message: 'Note content has changed since it was loaded',
+        contentVersion: currentVersion
+      });
+    }
+
+    if (hasPendingContentWrite(req, note._id)) {
+      return res.status(409).json({
+        code: 'WRITE_IN_PROGRESS',
+        message: 'A realtime content write is pending',
+        contentVersion: currentVersion
+      });
+    }
+
+    updates.content = req.body.content;
+    updates.updatedAt = new Date();
+
+    const updated = await Note.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        $and: [accessFilter(req.user.id), contentVersionFilter(contentVersion)]
+      },
+      {
+        $set: updates,
+        $inc: { contentVersion: 1 }
+      },
+      { new: true, runValidators: true }
+    );
+
+    if (!updated) {
+      const latestVersion = await findCurrentVersion(req.params.id);
+      if (latestVersion === null) {
+        return res.status(404).json({ message: 'Note not found' });
+      }
+      return res.status(409).json({
+        code: 'VERSION_CONFLICT',
+        message: 'Note content has changed since it was loaded',
+        contentVersion: latestVersion
+      });
+    }
+
+    if (hasPendingContentWrite(req, note._id)) {
+      return res.status(409).json({
+        code: 'WRITE_IN_PROGRESS',
+        message: 'A realtime content write is pending',
+        contentVersion: updated.contentVersion
+      });
+    }
+
+    res.json(updated);
   } catch (err) {
     res.status(500).send('Server error');
   }

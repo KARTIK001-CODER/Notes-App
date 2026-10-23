@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { 
   Box, 
   Paper, 
@@ -41,6 +41,68 @@ export default function NoteEditor() {
   const [snackbarSeverity, setSnackbarSeverity] = useState('success');
   const socketRef = useRef(null);
   const saveTimeout = useRef(null);
+  const contentVersionRef = useRef(0);
+  const latestContentRef = useRef(null);
+
+  const showSnackbar = useCallback((message, severity = 'success') => {
+    setSnackbarMessage(message);
+    setSnackbarSeverity(severity);
+    setSnackbarOpen(true);
+  }, []);
+
+  const saveToServer = useCallback(async (content) => {
+    if (typeof content !== 'string') return;
+
+    try {
+      setSaving(true);
+      const res = await API.put(`/notes/${id}`, {
+        content,
+        contentVersion: contentVersionRef.current
+      });
+      if (Number.isInteger(res.data.contentVersion)) {
+        contentVersionRef.current = Math.max(
+          contentVersionRef.current,
+          res.data.contentVersion
+        );
+      }
+      setSaving(false);
+    } catch (e) {
+      const status = e.response?.status;
+      const code = e.response?.data?.code;
+
+      if (status === 409 && code === 'WRITE_IN_PROGRESS') {
+        setSaving(false);
+        if (saveTimeout.current) clearTimeout(saveTimeout.current);
+        saveTimeout.current = setTimeout(() => {
+          saveTimeout.current = null;
+          void saveToServer(content);
+        }, 1000);
+        return;
+      }
+
+      if (status === 409) {
+        const serverVersion = e.response.data?.contentVersion;
+        if (Number.isInteger(serverVersion)) {
+          contentVersionRef.current = Math.max(contentVersionRef.current, serverVersion);
+        }
+        setSaving(false);
+        showSnackbar('A newer version was saved elsewhere. Refresh to sync.', 'warning');
+        return;
+      }
+
+      console.error('Save failed', e);
+      setSaving(false);
+      showSnackbar('Changes could not be saved. Please retry.', 'error');
+    }
+  }, [id, showSnackbar]);
+
+  const scheduleRestSave = useCallback((content) => {
+    if (saveTimeout.current) clearTimeout(saveTimeout.current);
+    saveTimeout.current = setTimeout(() => {
+      saveTimeout.current = null;
+      void saveToServer(content);
+    }, 1500);
+  }, [saveToServer]);
 
   useEffect(() => {
     // load note
@@ -48,6 +110,10 @@ export default function NoteEditor() {
       try {
         const res = await API.get(`/notes/${id}`);
         setNote(res.data);
+        contentVersionRef.current = Number.isInteger(res.data.contentVersion)
+          ? res.data.contentVersion
+          : 0;
+        latestContentRef.current = res.data.content || '';
         setIsPublic(res.data.isPublic || false);
         if (res.data.isPublic) {
           setPublicUrl(`${window.location.origin}/notes/public/${id}`);
@@ -61,38 +127,89 @@ export default function NoteEditor() {
     load();
 
     // connect socket
-    socketRef.current = io(SOCKET_URL);
-    socketRef.current.emit('join-note', id);
+    const token = localStorage.getItem('token');
+    socketRef.current = io(SOCKET_URL, { auth: { token } });
+
+    socketRef.current.on('connect', () => {
+      socketRef.current.emit('join-note', id, (response) => {
+        if (response?.ok === false) {
+          console.error('Realtime collaboration unavailable:', response.code);
+        }
+      });
+    });
+
+    socketRef.current.on('connect_error', () => {
+      console.error('Realtime connection unavailable');
+    });
 
     socketRef.current.on('note-update', ({ content }) => {
-      setNote(n => ({ ...n, content }));
+      if (typeof content === 'string') {
+        if (saveTimeout.current) {
+          clearTimeout(saveTimeout.current);
+          saveTimeout.current = null;
+        }
+        latestContentRef.current = content;
+        setNote(n => ({ ...n, content }));
+        setSaving(false);
+      }
+    });
+
+    socketRef.current.on('note-saved', ({ contentVersion }) => {
+      if (Number.isInteger(contentVersion)) {
+        contentVersionRef.current = Math.max(contentVersionRef.current, contentVersion);
+      }
+      setSaving(false);
+    });
+
+    socketRef.current.on('note-save-error', () => {
+      setSaving(false);
+      showSnackbar('Realtime save failed. Retrying through the API.', 'error');
+      scheduleRestSave(latestContentRef.current);
+    });
+
+    socketRef.current.on('note-access-revoked', () => {
+      setSaving(false);
+      showSnackbar('You no longer have access to edit this note.', 'error');
+    });
+
+    socketRef.current.on('disconnect', (reason) => {
+      if (reason === 'io client disconnect') return;
+      showSnackbar('Realtime connection lost. Saving through the API.', 'warning');
+      if (latestContentRef.current !== null) {
+        scheduleRestSave(latestContentRef.current);
+      }
     });
 
     return () => {
-      socketRef.current.emit('leave-note', id);
+      if (saveTimeout.current) {
+        clearTimeout(saveTimeout.current);
+        saveTimeout.current = null;
+      }
+      if (socketRef.current.connected) {
+        socketRef.current.emit('leave-note', id);
+      }
       socketRef.current.disconnect();
     };
-  }, [id]);
+  }, [id, navigate, scheduleRestSave, showSnackbar]);
 
   // send edits through socket (debounced)
   const onContentChange = (value) => {
+    latestContentRef.current = value;
     setNote(n => ({ ...n, content: value }));
+    setSaving(true);
+
     if (socketRef.current && socketRef.current.connected) {
-      socketRef.current.emit('note-edit', { noteId: id, content: value });
+      socketRef.current.emit('note-edit', { noteId: id, content: value }, (response) => {
+        if (response?.ok === false) {
+          setSaving(false);
+          showSnackbar('Realtime save failed. Retrying through the API.', 'error');
+          scheduleRestSave(value);
+        }
+      });
+      return;
     }
 
-    // also schedule a save to API (debounce)
-    if (saveTimeout.current) clearTimeout(saveTimeout.current);
-    saveTimeout.current = setTimeout(() => saveToServer(value), 1500);
-  };
-
-  const saveToServer = async (content) => {
-    try {
-      setSaving(true);
-      await API.put(`/notes/${id}`, { content });
-    } catch (e) {
-      console.error('Save failed', e);
-    } finally { setSaving(false); }
+    scheduleRestSave(value);
   };
 
   const onTitleChange = async (e) => {
@@ -130,12 +247,6 @@ export default function NoteEditor() {
     navigator.clipboard.writeText(window.location.href);
     setSnackbarMessage('Private link copied to clipboard!');
     setSnackbarSeverity('success');
-    setSnackbarOpen(true);
-  };
-
-  const showSnackbar = (message, severity = 'success') => {
-    setSnackbarMessage(message);
-    setSnackbarSeverity(severity);
     setSnackbarOpen(true);
   };
 

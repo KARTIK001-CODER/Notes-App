@@ -2,12 +2,12 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const { Server } = require('socket.io');
 require('dotenv').config();
 
 const authRoutes = require('./routes/auth');
 const noteRoutes = require('./routes/notes');
 const Note = require('./models/Note');
+const { createRealtimeServer } = require('./socket');
 
 const app = express();
 
@@ -40,41 +40,33 @@ const io = require("socket.io")(server, {
 });
 
 
-/**
- * Socket.IO: Rooms per note ID.
- * Clients join 'note:<noteId>' and emit 'note-edit' with { noteId, content }.
- * Server broadcasts 'note-update' to room except sender.
- */
+const realtime = createRealtimeServer(io, { Note });
+app.locals.notePersistence = realtime;
 
-io.on('connection', (socket) => {
-  console.log('Socket connected:', socket.id);
+let shuttingDown = false;
 
-  socket.on('join-note', (noteId) => {
-    const room = `note:${noteId}`;
-    socket.join(room);
-    console.log(socket.id, 'joined', room);
-  });
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
 
-  socket.on('leave-note', (noteId) => {
-    socket.leave(`note:${noteId}`);
-  });
+  let flushResult;
+  try {
+    flushResult = await realtime.flushAll();
+  } catch {
+    flushResult = { ok: false, pending: realtime.pendingCount(), failures: [] };
+  }
 
-  socket.on('note-edit', async ({ noteId, content }) => {
-    // broadcast to others in room
-    socket.to(`note:${noteId}`).emit('note-update', { content });
+  if (!flushResult.ok) {
+    console.error('Failed to flush pending note updates');
+  }
 
-    // optional: persist (debounce on client ideally)
-    try {
-      await Note.findByIdAndUpdate(noteId, { content, updatedAt: new Date() });
-    } catch (err) {
-      console.error('Error saving note from socket:', err);
-    }
-  });
+  io.close();
+  server.close(() => process.exit(flushResult.ok ? 0 : 1));
+  setTimeout(() => process.exit(1), 5000).unref();
+}
 
-  socket.on('disconnect', () => {
-    console.log('Socket disconnected', socket.id);
-  });
-});
+process.once('SIGTERM', shutdown);
+process.once('SIGINT', shutdown);
 
 // connect to DB & start
 mongoose.connect(process.env.MONGO_URI, { })
