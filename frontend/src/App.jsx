@@ -21,13 +21,15 @@ import {
   AccountCircle, 
   Logout,
   Notes,
-  Share
+  Share,
+  Public
 } from '@mui/icons-material';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import NotesList from './pages/NotesList';
 import NoteEditor from './pages/NoteEditor';
 import PublicNoteViewer from './pages/PublicNoteViewer';
+import PublicNotesList from './pages/PublicNotesList';
 import ProtectedRoute from './components/ProtectedRoute';
 import { lightTheme, darkTheme } from './theme';
 
@@ -97,6 +99,33 @@ export default function App() {
             </Box>
             
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              {user && (
+                <Button 
+                  color="inherit"
+                  component={Link}
+                  to="/"
+                  sx={{ 
+                    textTransform: 'none',
+                    fontSize: '1rem',
+                    '&:hover': { bgcolor: 'rgba(255, 255, 255, 0.1)' }
+                  }}
+                >
+                  My Notes
+                </Button>
+              )}
+              <Button 
+                color="inherit"
+                component={Link}
+                to="/public-notes"
+                startIcon={<Public />}
+                sx={{ 
+                  textTransform: 'none',
+                  fontSize: '1rem',
+                  '&:hover': { bgcolor: 'rgba(255, 255, 255, 0.1)' }
+                }}
+              >
+                Public
+              </Button>
               <IconButton 
                 onClick={toggleDarkMode} 
                 color="inherit"
@@ -190,6 +219,7 @@ export default function App() {
             <Route path="/register" element={<Register />} />
             <Route path="/" element={<ProtectedRoute><NotesList/></ProtectedRoute>} />
             <Route path="/notes/:id" element={<ProtectedRoute><NoteEditor/></ProtectedRoute>} />
+            <Route path="/public-notes" element={<PublicNotesList />} />
             <Route path="/notes/public/:id" element={<PublicNoteViewer />} />
           </Routes>
         </Container>

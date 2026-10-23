@@ -21,17 +21,20 @@ import {
 } from '@mui/icons-material';
 import { Link } from 'react-router-dom';
 import API from '../api';
+import GoogleSignInButton from '../components/GoogleSignInButton';
 
 export default function Login() {
   const [form, setForm] = useState({ email: '', password: '' });
   const [err, setErr] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
 
   const handle = (e) => setForm({ ...form, [e.target.name]: e.target.value });
 
   const submit = async (e) => {
     e.preventDefault();
+    if (googleLoading) return;
     setErr('');
     setLoading(true);
     
@@ -44,6 +47,23 @@ export default function Login() {
       setErr(e.response?.data?.message || 'Login failed. Please try again.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleGoogleCredential = async (credential) => {
+    if (loading || googleLoading) return;
+    setErr('');
+    setGoogleLoading(true);
+
+    try {
+      const res = await API.post('/auth/google', { credential });
+      localStorage.setItem('token', res.data.token);
+      localStorage.setItem('user', JSON.stringify(res.data.user));
+      window.location.href = '/';
+    } catch (e) {
+      setErr(e.response?.data?.message || 'Google sign-in failed. Please try again.');
+    } finally {
+      setGoogleLoading(false);
     }
   };
 
@@ -161,7 +181,7 @@ export default function Login() {
                 variant="contained" 
                 fullWidth
                 size="large"
-                disabled={loading}
+                disabled={loading || googleLoading}
                 sx={{
                   py: 1.5,
                   borderRadius: 2,
@@ -180,6 +200,14 @@ export default function Login() {
               or
             </Typography>
           </Divider>
+
+          <Box sx={{ mb: 3 }}>
+            <GoogleSignInButton
+              onCredential={handleGoogleCredential}
+              loading={googleLoading}
+              disabled={loading}
+            />
+          </Box>
 
           <Box sx={{ textAlign: 'center' }}>
             <Typography variant="body2" color="text.secondary">
